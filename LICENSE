@@ -1,11 +1,5 @@
 MIT License
 
-This plugin is a fork of the "agents" bar widget from Omarchy
-(https://github.com/basecamp/omarchy), which is MIT licensed. Panel.qml,
-Main.qml, Agent.qml and assets/ are derived from that project and remain
-under its copyright. ClaudeStatus.qml, ClaudeSessions.qml, bin/, setup and
-resync are original work. See NOTICE for the file-by-file breakdown.
-
 Copyright (c) Basecamp, LLC and the Omarchy contributors
 Copyright (c) 2026 AvA_l4nch
 
@@ -26,3 +20,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+This plugin is a fork of the "agents" bar widget from Omarchy
+(https://github.com/basecamp/omarchy), which is MIT licensed. Panel.qml,
+Main.qml, Agent.qml and assets/ are derived from that project and remain under
+its copyright. ClaudeStatus.qml, ClaudeSessions.qml, bin/, setup and resync are
+original work. See NOTICE for the file-by-file breakdown.
