@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Record Claude Code's per-session state so the Omarchy bar can colour its
+# agent icon. Called from Claude Code hooks, which pipe the hook payload
+# (session_id, hook_event_name, tool_name, cwd, message) in on stdin.
+#
+#   omarchy-claude-status working   # generating, or running a tool
+#   omarchy-claude-status waiting   # turn finished, your move
+#   omarchy-claude-status blocked   # stopped mid-task needing an answer
+#   omarchy-claude-status end       # session over, forget it
+#
+# Each session gets a file holding "<state>TAB<project>". The aggregate goes
+# to state/state as two lines — the winning state, then a label naming which
+# session won and how many others are live:
+#
+#   waiting
+#   api-server +2 more
+#
+# Louder states win: one session stuck on a question outranks another quietly
+# working, so the icon always reports the thing most worth your attention.
+
+set -uo pipefail
+
+state="${1:-idle}"
+dir="$HOME/.local/state/omarchy/claude-status"
+sessions="$dir/sessions"
+mkdir -p "$sessions"
+
+# Read every field in one pass, newline-separated rather than tab-separated:
+# cwd routinely contains spaces and @tsv + `read` would split it into pieces.
+payload="$(cat 2>/dev/null)"
+mapfile -t fields < <(printf '%s' "$payload" \
+  | jq -r '[(.session_id // ""), (.hook_event_name // ""), (.tool_name // ""),
+            (.cwd // ""), (.message // "")] | .[]' 2>/dev/null)
+
+session="${fields[0]:-}"
+event="${fields[1]:-}"
+tool="${fields[2]:-}"
+cwd="${fields[3]:-}"
+message="${fields[4]:-}"
+
+[ -n "$session" ] || session="pid-$PPID"
+session="${session//[^A-Za-z0-9._-]/_}"
+
+# The directory name is what you actually call the session in your head, and
+# it is the one label the payload hands over for free.
+label=""
+if [ "$cwd" = "$HOME" ]; then
+  label="home"
+elif [ -n "$cwd" ] && [ "$cwd" != "/" ]; then
+  label="$(basename -- "$cwd")"
+fi
+label="${label//[[:cntrl:]]/}"
+
+# Some tools are calls for help wearing a tool's clothes: PreToolUse fires,
+# then the tool blocks on an answer. Reporting those as "working" would paint
+# the icon busy for exactly as long as it is actually your turn. Only the
+# *Pre* side counts — by PostToolUse you have answered and work resumes.
+if [ "$event" = "PreToolUse" ]; then
+  case "$tool" in
+    AskUserQuestion|ExitPlanMode) state=blocked ;;
+  esac
+fi
+
+# Notification covers two unrelated things: a permission request, which is a
+# genuine mid-task stall, and a nudge that the prompt has sat idle — which
+# only ever arrives when the turn already ended. The message tells them apart.
+if [ "$event" = "Notification" ]; then
+  case "$message" in
+    *"waiting for your input"*) state=waiting ;;
+  esac
+fi
+
+if [ "$state" = "end" ]; then
+  rm -f "$sessions/$session"
+else
+  printf '%s\t%s' "$state" "$label" >"$sessions/$session"
+fi
+
+# Sessions killed without firing SessionEnd would otherwise pin the icon on
+# forever, so anything untouched for eight hours is treated as gone.
+find "$sessions" -maxdepth 1 -type f -mmin +480 -delete 2>/dev/null
+
+rank() {
+  case "$1" in
+    blocked) echo 3 ;;
+    waiting) echo 2 ;;
+    working) echo 1 ;;
+    *)       echo 0 ;;
+  esac
+}
+
+aggregate=idle
+detail=""
+best=0
+live=0
+table=""
+for f in "$sessions"/*; do
+  [ -f "$f" ] || continue
+  line="$(cat "$f" 2>/dev/null)"
+  value="${line%%$'\t'*}"
+  name="${line#*$'\t'}"
+  [ "$name" = "$line" ] && name=""
+  live=$((live + 1))
+  r="$(rank "$value")"
+  if [ "$r" -gt "$best" ]; then
+    best="$r"
+    aggregate="$value"
+    detail="$name"
+  fi
+  # rank first so the panel can sort without re-deriving the ordering, then
+  # mtime so it can age each row without a clock of its own.
+  table+="$r"$'\t'"$value"$'\t'"$name"$'\t'"$(stat -c %Y "$f" 2>/dev/null || echo 0)"$'\n'
+done
+
+# One line per session, loudest first, for the panel's Sessions section. Kept
+# separate from the state file so the icon's parse stays a two-line read that
+# cannot be confused by a session list that grew a field.
+printf '%s' "$(printf '%s' "$table" | sort -t$'\t' -k1,1nr -k3,3)" >"$dir/sessions.tsv"
+
+others=$((live - 1))
+if [ "$others" -gt 0 ]; then
+  [ -n "$detail" ] || detail="a session"
+  detail="$detail +$others more"
+fi
+
+# Written in place rather than renamed into place: a rename swaps the inode
+# out from under the shell's inotify watch and the bar stops seeing updates.
+# Both lines land in one write, so the bar never sees a state and a label
+# that disagree.
+printf '%s\n%s' "$aggregate" "$detail" >"$dir/state"

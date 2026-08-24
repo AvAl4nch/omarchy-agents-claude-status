@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Re-clone this plugin from the Omarchy that is installed right now, then
+# re-apply the Claude-status patches on top.
+#
+# This plugin is a fork of the built-in agents widget, kept that way on
+# purpose so limits, token usage and Claude session status share one bar
+# button. The cost of a fork is drift: upstream keeps improving agents/, and
+# it is free to rename the qs.Ui components this file leans on. Run this after
+# an `omarchy update` to take their changes and keep ours.
+#
+#   ./resync            # re-clone, re-patch, validate
+#   ./resync --diff     # show what upstream changed since the last resync
+#   ./resync --check    # verify the patches are applied; touch nothing
+#
+# Ours lives in ClaudeStatus.qml and ClaudeSessions.qml, which upstream never
+# touches. The whole delta to their Panel.qml is the three PATCH blocks below.
+# Keep it that way — every line added here is a line this script has to
+# re-apply forever.
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/agents"
+# The id is the manifest's, not the folder's: `omarchy plugin add` names the
+# folder from the repo, which need not match.
+PLUGIN_ID="$(jq -r '.id' "$PLUGIN_DIR/manifest.identity.json" 2>/dev/null)"
+MODE="apply"
+
+# Backups and the recorded upstream copy live OUTSIDE the plugin folder on
+# purpose. The shell finds plugins with `find <plugins> -mindepth 2 -maxdepth
+# 3 -name manifest.json`, so a manifest.json parked in a subfolder here — and
+# the recorded upstream copy still calls itself omarchy.agents — would register
+# as a second, competing plugin.
+WORK_DIR="$HOME/.local/state/omarchy/agents-fork"
+UPSTREAM_SNAPSHOT="$WORK_DIR/upstream"
+
+case "${1:-}" in
+  --diff)  MODE="diff" ;;
+  --check) MODE="check" ;;
+  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  "") ;;
+  *) echo "resync: unknown option '$1'" >&2; exit 2 ;;
+esac
+
+die() { echo "resync: $*" >&2; exit 1; }
+note() { echo "  $*"; }
+
+[ -d "$UPSTREAM" ] || die "no built-in agents plugin at $UPSTREAM"
+[ -f "$PLUGIN_DIR/ClaudeStatus.qml" ] || die "ClaudeStatus.qml missing — wrong directory?"
+[ -n "$PLUGIN_ID" ] && [ "$PLUGIN_ID" != "null" ] || die "no id in manifest.identity.json"
+
+# ---------------------------------------------------------------- the patches
+#
+# Each is an anchor line that must appear exactly once in upstream's Panel.qml,
+# a position, and the text to splice in. An anchor that stops matching is the
+# signal that upstream restructured the file and this needs a human — which is
+# the whole reason the anchors are asserted rather than pattern-matched loosely.
+
+IFS='' read -r -d '' PATCH_STATUS <<'QML'
+
+  // [claude-status] Live Claude Code status. See ClaudeStatus.qml and resync.
+  ClaudeStatus {
+    id: claude
+    foreground: root.foreground
+    dim: root.dim
+    breathTarget: button
+  }
+QML
+
+IFS='' read -r -d '' PATCH_BUTTON <<'QML'
+    foreground: claude.statusColor // [claude-status]
+    tooltipText: claude.tooltipText // [claude-status]
+
+QML
+
+IFS='' read -r -d '' PATCH_SESSIONS <<'QML'
+          // [claude-status] Sessions list. See ClaudeSessions.qml and resync.
+          ClaudeSessions {
+            width: parent.width
+            claude: claude
+            foreground: root.foreground
+            dim: root.dim
+            fontFamily: root.fontFamily
+            nowMs: root.nowMs
+          }
+
+QML
+
+ANCHOR_STATUS='  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family'
+ANCHOR_BUTTON='    active: root.alarming'
+ANCHOR_SESSIONS='          // ---------- Usage ----------'
+
+# splice <file> <anchor> <after|before> <text>
+splice() {
+  local file="$1" anchor="$2" where="$3" text="$4"
+  local count
+  count="$(grep -Fxc -- "$anchor" "$file" 2>/dev/null || echo 0)"
+  [ "$count" = "1" ] || die "anchor appears $count times, expected once: '$anchor'
+       upstream restructured Panel.qml — re-apply this patch by hand, then
+       update the anchor in resync."
+  ANCHOR="$anchor" WHERE="$where" TEXT="$text" awk '
+    BEGIN { anchor = ENVIRON["ANCHOR"]; where = ENVIRON["WHERE"]; text = ENVIRON["TEXT"]
+            sub(/\n$/, "", text) }
+    $0 == anchor && where == "before" { print text }
+    { print }
+    $0 == anchor && where == "after" { print text }
+  ' "$file" >"$file.tmp" && mv "$file.tmp" "$file"
+}
+
+patched_count() { grep -Fc '[claude-status]' "$1" 2>/dev/null || echo 0; }
+
+# qmllint our two files against the installed shell, as omarchyplugins.com asks
+# of plugin authors. `qs.*` is Quickshell's alias for the shell root and has no
+# qmldir of its own, so linting needs a throwaway tree where qs points at it.
+#
+# Two categories are switched off rather than grepped away, so qmllint's own
+# exit code stays meaningful and nothing else can slip past a filter:
+#
+#   missing-property — Style's nested QtObjects (Style.font.body,
+#     Style.spacing.sm) do not resolve statically. Upstream's files trip it too.
+#   unqualified — reaching an outer id from inside an inline `component`. It is
+#     how the whole shell is written, including upstream's own LimitRow. The
+#     pragma that silences it, ComponentBehavior: Bound, is not understood by
+#     Quickshell's parser and makes it log a parse error on every start.
+lint_ours() {
+  # `qmllint` on PATH is not necessarily Qt 6's: this machine has a /usr/bin
+  # one calling itself version 1.0 that rejects the category flags outright.
+  # Pick the first candidate that actually understands them.
+  # Probed with a command substitution rather than `| grep -q`: grep exits on
+  # first match, SIGPIPEs qmllint, and pipefail then fails the pipeline — which
+  # made this skip the linter at random.
+  local qmllint="" candidate help
+  for candidate in /usr/lib/qt6/bin/qmllint "$(command -v qmllint 2>/dev/null)"; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    help="$("$candidate" --help 2>&1)"
+    case "$help" in
+      *--unqualified*) qmllint="$candidate"; break ;;
+    esac
+  done
+  [ -n "$qmllint" ] || { note "no qmllint understanding --unqualified — skipped"; return 0; }
+
+  local tree status
+  tree="$(mktemp -d)"
+  ln -s "${OMARCHY_PATH:-/usr/share/omarchy}/shell" "$tree/qs"
+  "$qmllint" -I "$tree" --unqualified disable --missing-property disable \
+    "$PLUGIN_DIR/ClaudeStatus.qml" "$PLUGIN_DIR/ClaudeSessions.qml"
+  status=$?
+  rm -rf "$tree"
+
+  [ "$status" -eq 0 ] || die "qmllint found problems in ClaudeStatus.qml / ClaudeSessions.qml"
+  note "qmllint: clean"
+}
+
+# ------------------------------------------------------------------- --check
+
+if [ "$MODE" = "check" ]; then
+  n="$(patched_count "$PLUGIN_DIR/Panel.qml")"
+  for f in ClaudeStatus.qml ClaudeSessions.qml; do
+    [ -f "$PLUGIN_DIR/$f" ] || die "$f is missing"
+  done
+  [ "$n" = "4" ] || die "expected 4 [claude-status] markers in Panel.qml, found $n"
+  echo "resync: patches present (4 markers, both QML files, id $PLUGIN_ID)"
+  exit 0
+fi
+
+# -------------------------------------------------------------------- --diff
+
+if [ "$MODE" = "diff" ]; then
+  if [ ! -f "$UPSTREAM_SNAPSHOT/Panel.qml" ]; then
+    die "no recorded upstream copy yet — run ./resync once to create one"
+  fi
+  echo "Upstream changes since the last resync:"
+  for f in Panel.qml Main.qml Agent.qml manifest.json; do
+    diff -u "$UPSTREAM_SNAPSHOT/$f" "$UPSTREAM/$f" || true
+  done
+  exit 0
+fi
+
+# -------------------------------------------------------------------- apply
+
+backup="$WORK_DIR/backup-$(date +%s)"
+mkdir -p "$backup"
+cp -a "$PLUGIN_DIR"/*.qml "$PLUGIN_DIR/manifest.json" "$backup/" 2>/dev/null
+note "backed up current copy to $backup"
+
+# Take upstream's files. Ours are never in this list, so they survive untouched.
+for f in Panel.qml Main.qml Agent.qml manifest.json; do
+  [ -f "$UPSTREAM/$f" ] || die "upstream is missing $f — the agents plugin was restructured"
+  cp -a "$UPSTREAM/$f" "$PLUGIN_DIR/$f"
+done
+[ -d "$UPSTREAM/assets" ] && { rm -rf "$PLUGIN_DIR/assets"; cp -a "$UPSTREAM/assets" "$PLUGIN_DIR/assets"; }
+note "took Panel.qml, Main.qml, Agent.qml, manifest.json, assets/ from $UPSTREAM"
+
+# Record exactly what we took, so --diff can show what moved next time.
+rm -rf "$UPSTREAM_SNAPSHOT"; mkdir -p "$UPSTREAM_SNAPSHOT"
+cp -a "$UPSTREAM"/*.qml "$UPSTREAM/manifest.json" "$UPSTREAM_SNAPSHOT/" 2>/dev/null
+
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_STATUS"   after  "$PATCH_STATUS"
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_BUTTON"   after  "$PATCH_BUTTON"
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_SESSIONS" before "$PATCH_SESSIONS"
+note "re-applied 3 patches to Panel.qml"
+
+# Upstream's manifest calls itself omarchy.agents and credits Omarchy. Take
+# their functional fields — barWidget defaults, the settings schema — and lay
+# our identity over the top.
+#
+# `omarchy.clonedFrom` is deliberately deleted. It is a local-fork mechanism:
+# it makes the shell route omarchy.agents calls to this plugin, which is right
+# on the machine that cloned it and hostile on anyone else's, where installing
+# this would silently displace their built-in agents widget.
+tmp="$(mktemp)"
+jq -s '.[0] * .[1] | del(.omarchy)' \
+  "$PLUGIN_DIR/manifest.json" "$PLUGIN_DIR/manifest.identity.json" >"$tmp" \
+  && mv "$tmp" "$PLUGIN_DIR/manifest.json" || die "failed to rewrite manifest.json"
+note "manifest identity applied: $PLUGIN_ID"
+
+if command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  omarchy-plugin-validate "$PLUGIN_DIR" || die "plugin validation failed"
+  note "omarchy plugin validate: ok"
+fi
+
+lint_ours
+
+markers="$(patched_count "$PLUGIN_DIR/Panel.qml")"
+[ "$markers" = "4" ] || die "expected 4 [claude-status] markers after patching, found $markers"
+
+echo
+echo "resync: done. Restart the shell to load it:  omarchy restart shell"
+echo "        (hot-reload does not recompile QML — a restart is required)"
+echo "        Then check the diff for anything upstream changed:  ./resync --diff"

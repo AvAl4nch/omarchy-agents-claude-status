@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Install (or remove) the half of this plugin that lives outside the shell.
+#
+# The bar widget only ever reads files. What writes them is a small script
+# driven by Claude Code's hooks, and Omarchy plugins have no install step of
+# their own — so without running this once, the widget installs looking normal
+# and silently never changes colour.
+#
+#   ./setup              # install the hook script and register the hooks
+#   ./setup --uninstall  # remove both, and the recorded state
+#   ./setup --status     # report what is and is not in place
+#
+# Safe to re-run: the hooks are keyed by name and replaced, not appended.
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$PLUGIN_DIR/bin/omarchy-claude-status"
+DEST_DIR="$HOME/.local/bin"
+DEST="$DEST_DIR/omarchy-claude-status"
+SETTINGS="$HOME/.claude/settings.json"
+STATE_DIR="$HOME/.local/state/omarchy/claude-status"
+MODE="install"
+
+case "${1:-}" in
+  --uninstall) MODE="uninstall" ;;
+  --status)    MODE="status" ;;
+  -h|--help)   sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  "") ;;
+  *) echo "setup: unknown option '$1'" >&2; exit 2 ;;
+esac
+
+die()  { echo "setup: $*" >&2; exit 1; }
+note() { echo "  $*"; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required (the hook script parses Claude Code's payloads with it)"
+
+# The six hooks, and the state each reports. The script refines them further
+# from the payload: a PreToolUse for AskUserQuestion or ExitPlanMode becomes
+# 'blocked', and a Notification whose message is the idle nudge rather than a
+# permission request becomes 'waiting'.
+HOOK_EVENTS=(UserPromptSubmit PreToolUse PostToolUse Notification Stop SessionEnd)
+hook_state() {
+  case "$1" in
+    Notification) echo blocked ;;
+    Stop)         echo waiting ;;
+    SessionEnd)   echo end ;;
+    *)            echo working ;;
+  esac
+}
+# PreToolUse and PostToolUse are the only ones that take a matcher.
+hook_matcher() {
+  case "$1" in
+    PreToolUse|PostToolUse) echo '*' ;;
+    *)                      echo "" ;;
+  esac
+}
+
+# ------------------------------------------------------------------- status
+
+if [ "$MODE" = "status" ]; then
+  [ -x "$DEST" ] && note "hook script: $DEST" || note "hook script: NOT installed"
+  if [ -f "$SETTINGS" ]; then
+    for event in "${HOOK_EVENTS[@]}"; do
+      if jq -e --arg e "$event" '
+            (.hooks[$e] // []) | any(.hooks[]?.command // "" | test("omarchy-claude-status"))
+          ' "$SETTINGS" >/dev/null 2>&1; then
+        note "hook $event: registered"
+      else
+        note "hook $event: MISSING"
+      fi
+    done
+  else
+    note "no $SETTINGS"
+  fi
+  [ -f "$STATE_DIR/state" ] && note "current state: $(head -1 "$STATE_DIR/state")" || note "no state recorded yet"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- uninstall
+
+if [ "$MODE" = "uninstall" ]; then
+  rm -f "$DEST" && note "removed $DEST"
+  if [ -f "$SETTINGS" ]; then
+    tmp="$(mktemp)"
+    # Drop only our own entries. Someone else's hooks on the same events stay.
+    jq '
+      if .hooks then
+        .hooks |= with_entries(
+          .value |= (
+            map(.hooks |= map(select((.command // "") | test("omarchy-claude-status") | not)))
+            | map(select((.hooks | length) > 0))
+          )
+        )
+        | .hooks |= with_entries(select((.value | length) > 0))
+        | (if (.hooks | length) == 0 then del(.hooks) else . end)
+      else . end
+    ' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS" || die "failed to rewrite $SETTINGS"
+    note "removed our hooks from $SETTINGS"
+  fi
+  rm -rf "$STATE_DIR" && note "removed $STATE_DIR"
+  echo
+  echo "setup: done. The widget will sit at the idle colour until reinstalled."
+  exit 0
+fi
+
+# ------------------------------------------------------------------ install
+
+[ -f "$SRC" ] || die "missing $SRC — is this the plugin folder?"
+
+mkdir -p "$DEST_DIR"
+install -m 0755 "$SRC" "$DEST"
+note "installed $DEST"
+
+case ":$PATH:" in
+  *":$DEST_DIR:"*) ;;
+  *) note "note: $DEST_DIR is not on PATH — the hooks use the absolute path, so this is cosmetic" ;;
+esac
+
+mkdir -p "$(dirname "$SETTINGS")"
+[ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
+jq -e . "$SETTINGS" >/dev/null 2>&1 || die "$SETTINGS is not valid JSON — fix it first, this will not overwrite it"
+
+backup="$SETTINGS.bak.$(date +%s)"
+cp "$SETTINGS" "$backup"
+note "backed up settings to $backup"
+
+# Build the hook entries as JSON, then merge. Output is redirected to /dev/null
+# in the command itself: anything a hook prints on UserPromptSubmit is injected
+# into Claude's context.
+hooks_json='{}'
+for event in "${HOOK_EVENTS[@]}"; do
+  state="$(hook_state "$event")"
+  matcher="$(hook_matcher "$event")"
+  entry="$(jq -n --arg cmd "$DEST $state >/dev/null 2>&1" --arg m "$matcher" '
+    { hooks: [ { type: "command", command: $cmd, timeout: 5 } ] }
+    | if $m == "" then . else {matcher: $m} + . end
+  ')"
+  hooks_json="$(jq --arg e "$event" --argjson entry "$entry" '.[$e] = [$entry]' <<<"$hooks_json")"
+done
+
+# Append to each event rather than assigning it: someone else's hook on Stop or
+# PreToolUse has to survive this. Our own previous entries are stripped first,
+# so re-running replaces them instead of stacking duplicates.
+tmp="$(mktemp)"
+jq --argjson new "$hooks_json" '
+  .hooks = (
+    reduce ($new | to_entries[]) as $e ((.hooks // {});
+      .[$e.key] = (
+        ((.[$e.key] // [])
+          | map(.hooks |= map(select((.command // "") | test("omarchy-claude-status") | not)))
+          | map(select((.hooks | length) > 0)))
+        + $e.value
+      )
+    )
+  )
+' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS" || die "failed to write $SETTINGS"
+note "registered ${#HOOK_EVENTS[@]} hooks in $SETTINGS"
+
+mkdir -p "$STATE_DIR/sessions"
+printf 'idle\n' >"$STATE_DIR/state"
+: >"$STATE_DIR/sessions.tsv"
+note "primed $STATE_DIR"
+
+echo
+echo "setup: done."
+echo "  Claude Code re-reads settings.json without restarting, so running"
+echo "  sessions pick the hooks up on their next tool call."
+echo "  Check with:  ./setup --status"

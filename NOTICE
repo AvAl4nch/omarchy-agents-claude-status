@@ -1,0 +1,32 @@
+This plugin bundles code from Omarchy.
+
+    Omarchy — https://github.com/basecamp/omarchy
+    Copyright (c) Basecamp, LLC and the Omarchy contributors
+    MIT License
+
+It is a fork of Omarchy's built-in `omarchy.agents` bar widget, so that
+Claude Code session status can share one bar button with the usage panel
+instead of adding a second icon.
+
+From Omarchy, unmodified:
+
+    Main.qml
+    Agent.qml
+    assets/
+
+From Omarchy, with three additions marked `[claude-status]`:
+
+    Panel.qml
+
+Original to this plugin:
+
+    ClaudeStatus.qml
+    ClaudeSessions.qml
+    bin/omarchy-claude-status
+    setup
+    resync
+    manifest.identity.json
+
+`resync` re-derives the Omarchy-derived files from the copy of Omarchy
+installed on the machine and re-applies the three additions, so the fork can
+be brought back in line after an `omarchy update`.

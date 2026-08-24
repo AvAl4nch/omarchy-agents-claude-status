@@ -1,0 +1,5 @@
+# Nothing generated lives in the plugin folder: resync keeps its backups and
+# the recorded upstream copy in ~/.local/state/omarchy/agents-fork/ so a stray
+# manifest.json here cannot register as a second plugin.
+*.tmp
+*.bak.*
