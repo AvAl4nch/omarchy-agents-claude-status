@@ -25,9 +25,24 @@ dir="$HOME/.local/state/omarchy/claude-status"
 sessions="$dir/sessions"
 mkdir -p "$sessions"
 
+# Hook payloads are small by construction, but `message` is assembled from
+# whatever the tool said, so the size is not ours to promise. Take a bounded
+# prefix: a truncated payload loses its trailing JSON and jq drops it, which
+# degrades to "no fields" rather than to an unbounded read.
+MAX_PAYLOAD_BYTES=65536
+# Longest session id and label we will keep. Both end up in a filename or in
+# the two-line state file the bar parses; neither has any business being long.
+MAX_SESSION_CHARS=64
+MAX_LABEL_CHARS=64
+# Most sessions any one machine tracks. Every refresh reads all of them, so
+# this bounds both the directory and the aggregation below.
+MAX_SESSIONS=100
+
 # Read every field in one pass, newline-separated rather than tab-separated:
 # cwd routinely contains spaces and @tsv + `read` would split it into pieces.
-payload="$(cat 2>/dev/null)"
+# Drained after the cut so the caller writing the payload never takes an
+# EPIPE for a payload we simply chose not to keep all of.
+payload="$(head -c "$MAX_PAYLOAD_BYTES" 2>/dev/null; cat >/dev/null 2>&1)"
 mapfile -t fields < <(printf '%s' "$payload" \
   | jq -r '[(.session_id // ""), (.hook_event_name // ""), (.tool_name // ""),
             (.cwd // ""), (.message // "")] | .[]' 2>/dev/null)
@@ -40,6 +55,7 @@ message="${fields[4]:-}"
 
 [ -n "$session" ] || session="pid-$PPID"
 session="${session//[^A-Za-z0-9._-]/_}"
+session="${session:0:$MAX_SESSION_CHARS}"
 
 # The directory name is what you actually call the session in your head, and
 # it is the one label the payload hands over for free.
@@ -49,7 +65,10 @@ if [ "$cwd" = "$HOME" ]; then
 elif [ -n "$cwd" ] && [ "$cwd" != "/" ]; then
   label="$(basename -- "$cwd")"
 fi
+# Control characters would carry a newline or a tab into the state file and
+# the panel would read one row as two, or one field as three.
 label="${label//[[:cntrl:]]/}"
+label="${label:0:$MAX_LABEL_CHARS}"
 
 # Some tools are calls for help wearing a tool's clothes: PreToolUse fires,
 # then the tool blocks on an answer. Reporting those as "working" would paint
@@ -80,6 +99,22 @@ fi
 # forever, so anything untouched for eight hours is treated as gone.
 find "$sessions" -maxdepth 1 -type f -mmin +480 -delete 2>/dev/null
 
+# Age alone does not bound the directory: a burst of short-lived sessions can
+# leave hundreds of fresh files, and the loop below reads every one of them on
+# every hook. Keep the most recently touched and drop the tail.
+prune_excess_sessions() {
+  local -a stale=()
+  mapfile -d '' -t stale < <(
+    find "$sessions" -maxdepth 1 -type f -printf '%T@\t%p\0' 2>/dev/null \
+      | sort -z -rn \
+      | tail -z -n "+$((MAX_SESSIONS + 1))" \
+      | cut -z -f2-
+  )
+  [ "${#stale[@]}" -gt 0 ] && rm -f -- "${stale[@]}"
+  return 0
+}
+prune_excess_sessions
+
 rank() {
   case "$1" in
     blocked) echo 3 ;;
@@ -96,10 +131,18 @@ live=0
 table=""
 for f in "$sessions"/*; do
   [ -f "$f" ] || continue
-  line="$(cat "$f" 2>/dev/null)"
+  # One row is "<state>TAB<label>" and both halves are capped above, so a
+  # short bounded read is the whole record. Anything longer is not ours.
+  line="$(head -c 256 -- "$f" 2>/dev/null)"
   value="${line%%$'\t'*}"
   name="${line#*$'\t'}"
   [ "$name" = "$line" ] && name=""
+  # Split first, then strip: a stray tab or newline in a file we did not write
+  # would otherwise become an extra column and shift every field after it.
+  value="${value//[[:cntrl:]]/}"
+  name="${name//[[:cntrl:]]/}"
+  value="${value:0:16}"
+  name="${name:0:$MAX_LABEL_CHARS}"
   live=$((live + 1))
   r="$(rank "$value")"
   if [ "$r" -gt "$best" ]; then

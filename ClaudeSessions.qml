@@ -83,6 +83,10 @@ Column {
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
+      // A session name is a directory name off disk. AutoText would sniff one
+      // containing markup as rich text and render it — including <img>, which
+      // fetches. Nothing here is ever markup, so say so.
+      textFormat: Text.PlainText
       elide: Text.ElideRight
       anchors.left: sessionDot.right
       anchors.leftMargin: Style.spacing.sm
@@ -101,6 +105,7 @@ Column {
       color: sessionRow.tint
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
+      textFormat: Text.PlainText
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
     }

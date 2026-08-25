@@ -28,27 +28,48 @@ Item {
   property string detail: ""
   property var sessions: []
 
+  // The writer caps every field it produces, but this side reads files it did
+  // not write and must not depend on that: the panel builds a row per entry
+  // and a Text per row, so an oversized file is a rendering cost, not just a
+  // parsing one. Both limits sit above anything the hook can legitimately
+  // produce (MAX_SESSIONS=100, MAX_LABEL_CHARS=64 in bin/omarchy-claude-status).
+  readonly property int maxSessions: 100
+  readonly property int maxFieldChars: 64
+
+  // One field, trimmed of control characters and cut to length. Control
+  // characters matter beyond tidiness: a newline in a label would make one
+  // row draw as two and push the rest of the panel down.
+  function safeField(value, limit) {
+    var cap = limit === undefined ? maxFieldChars : limit
+    var text = String(value === undefined || value === null ? "" : value)
+    text = text.replace(/[\x00-\x1f\x7f]/g, "").trim()
+    return text.length > cap ? text.substring(0, cap) : text
+  }
+
   // ------------------------------------------------------------------ input
 
   function applyState(content) {
     var lines = String(content || "").split("\n")
-    root.status = String(lines[0] || "").trim() || "idle"
-    root.detail = String(lines.length > 1 ? lines[1] : "").trim()
+    root.status = safeField(lines[0], 16) || "idle"
+    // A full-length label plus the " +N more" suffix, so a long project name
+    // does not push the count of the other live sessions off the end.
+    root.detail = safeField(lines.length > 1 ? lines[1] : "", maxFieldChars + 16)
   }
 
   function applySessions(content) {
     var out = []
     var lines = String(content || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
+    for (var i = 0; i < lines.length && out.length < maxSessions; i++) {
       // rank, state, label, mtime — a short line is a torn read, not a row.
       var parts = lines[i].split("\t")
       if (parts.length < 4) continue
-      var state = String(parts[1] || "").trim()
+      var state = safeField(parts[1])
       if (state === "") continue
+      var updatedMs = Number(parts[3]) * 1000
       out.push({
         state: state,
-        label: String(parts[2] || "").trim(),
-        updatedMs: Number(parts[3]) * 1000
+        label: safeField(parts[2]),
+        updatedMs: isFinite(updatedMs) ? updatedMs : 0
       })
     }
     root.sessions = out
