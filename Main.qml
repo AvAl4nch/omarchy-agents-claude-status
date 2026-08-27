@@ -310,6 +310,9 @@ Item {
   // Active days are a real history — a year of use is 365 legitimate entries —
   // so this one is loose enough not to undercount, and still finite.
   readonly property int syncMaxDates: 512
+  // A day count is one integer, so this is not a memory bound — it just keeps
+  // a snapshot that claims 1e308 active days from rendering as one.
+  readonly property int syncMaxActiveDays: 36500
   readonly property int syncMaxTextChars: 64
 
   // A sync directory is meant to be a synced folder under $HOME or a mounted
@@ -334,6 +337,19 @@ Item {
     if (String(root.syncDir || "").trim() !== "" && !root.syncDirAllowed(root.syncEffectiveDir))
       console.warn("agents/sync", "Ignoring sync dir outside "
         + root.syncAllowedRoots.join(", ") + ":", root.syncEffectiveDir)
+  }
+
+  // A snapshot may name providers this machine has never run, and those are
+  // welcome to the remaining slots under syncMaxProviders. They must not take
+  // slots from a provider that is installed here: the cap fills first-come, in
+  // scan order, and scan order is alphabetical, so one junk file named early in
+  // the alphabet could otherwise hide the user's own usage entirely.
+  function syncProviderKnown(id) {
+    for (var i = 0; i < agents.length; i++) {
+      var record = agents[i] ? agents[i].record : null
+      if (record && record.id && String(record.id) === id) return true
+    }
+    return false
   }
 
   // Strips control characters and the angle brackets Qt sniffs a string as
@@ -654,9 +670,10 @@ Item {
         if (++providerCount > root.syncMaxProvidersPerSnapshot) break // [claude-status]
         var safeProviderId = root.safeSyncText(providerId, 64) // [claude-status]
         if (safeProviderId === "") continue // [claude-status]
-        // [claude-status] every snapshot may name providers this machine has
-        // never heard of, so cap the accumulator across all of them too
-        if (!providers[safeProviderId] && Object.keys(providers).length >= root.syncMaxProviders) continue
+        // [claude-status] cap the accumulator across all snapshots, but never
+        // at the expense of a provider that is installed on this machine
+        if (!providers[safeProviderId] && Object.keys(providers).length >= root.syncMaxProviders
+            && !root.syncProviderKnown(safeProviderId)) continue
         var stats = snapshotProviders[providerId] || {}
         var acc = providerAcc(safeProviderId) // [claude-status]
         acc.devices[device] = true
@@ -683,7 +700,9 @@ Item {
           if (Object.keys(acc.activeDates).length >= root.syncMaxDates) break
           acc.activeDates[activeDate] = true
         }
-        acc.activeDays = Math.max(acc.activeDays, numberValue(stats.activeDays))
+        // [claude-status] the date union is capped, but this count arrives as a
+        // bare number a snapshot can set to anything; keep it in human range
+        acc.activeDays = Math.min(root.syncMaxActiveDays, Math.max(acc.activeDays, numberValue(stats.activeDays)))
         combineObjectNumbers(additive, acc.todayTokensByModel, stats.todayTokensByModel || {})
 
         var recent = Array.isArray(stats.recentDays) ? stats.recentDays : []

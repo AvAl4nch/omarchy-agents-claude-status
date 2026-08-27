@@ -177,9 +177,9 @@ unbounded; this fork bounds it, because a shared folder is not trusted input:
 | bytes per file | 64 KB |
 | collector output | 4 MB, capped before it is split |
 | snapshots parsed | 64 |
-| providers | 32 per snapshot, 32 in the merged result |
+| providers | 32 per snapshot, and 32 in the merged result — but a provider installed on this machine is never displaced by one that is not, so a junk file sorted early in the alphabet cannot hide your own usage |
 | map keys (models, token buckets) | 64 |
-| active dates | 512 — a year of real history still counts |
+| active dates | 512 kept, so a year of real history still counts; the day count itself is clamped to 36500, since it arrives as a bare number a snapshot can set to anything |
 | synced strings | 64 chars (96 for ids), control characters and `<`/`>` removed, so nothing reaches an `AutoText` element as markup |
 
 The scan names each file by a sanitised basename, so a crafted filename in the
