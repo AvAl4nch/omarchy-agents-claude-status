@@ -13,9 +13,18 @@
 #   ./resync --check    # verify the patches are applied; touch nothing
 #
 # Ours lives in ClaudeStatus.qml and ClaudeSessions.qml, which upstream never
-# touches. The whole delta to their Panel.qml is the three PATCH blocks below.
-# Keep it that way — every line added here is a line this script has to
+# touches. The rest of the delta is the PATCH blocks below: four splices into
+# their Panel.qml, and a set of bounds on the synced-snapshot path in their
+# Main.qml. Keep it small — every line added here is a line this script has to
 # re-apply forever.
+#
+# Two kinds of patch, both assert-first so upstream drift stops the script
+# instead of silently landing somewhere wrong:
+#
+#   splice  — an anchor line that must appear exactly once, and text to insert
+#             before or after it.
+#   replace — a line that must appear exactly once, and the text that stands in
+#             for it. Used where a bound has to go inside a line upstream owns.
 
 set -uo pipefail
 
@@ -37,7 +46,7 @@ UPSTREAM_SNAPSHOT="$WORK_DIR/upstream"
 case "${1:-}" in
   --diff)  MODE="diff" ;;
   --check) MODE="check" ;;
-  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  -h|--help) sed -n '2,27p' "$0" | sed 's/^# \?//'; exit 0 ;;
   "") ;;
   *) echo "resync: unknown option '$1'" >&2; exit 2 ;;
 esac
@@ -90,6 +99,195 @@ ANCHOR_STATUS='  readonly property string fontFamily: bar ? bar.fontFamily : Sty
 ANCHOR_BUTTON='    active: root.alarming'
 ANCHOR_SESSIONS='          // ---------- Usage ----------'
 
+IFS='' read -r -d '' PATCH_MODEL_NAME <<'QML'
+      // [claude-status] the model id behind this comes from a synced snapshot
+      textFormat: Text.PlainText
+QML
+
+ANCHOR_MODEL_NAME='      id: modelName'
+
+# ------------------------------------------------- Main.qml: sync-scan bounds
+#
+# Upstream trusts the synced directory. It scans whatever path the user put in
+# settings, concatenates every *.json there into one StdioCollector, and merges
+# the result with no cap on files, bytes, snapshots, providers, map keys or
+# string lengths — and the merged strings land in qs.Ui components whose Text
+# elements are AutoText. Those files come off a shared folder, so this fork
+# treats the whole path as foreign input.
+#
+# Kept as line-level replaces rather than whole-function copies on purpose:
+# upstream keeps improving the merge logic (mixed-version fields, account vs
+# device scope), and a copy would quietly throw those away on every resync.
+
+IFS='' read -r -d '' PATCH_BOUNDS <<'QML'
+
+  // [claude-status] Bounds on the synced-snapshot path. See resync.
+  readonly property int syncMaxFiles: 64
+  readonly property int syncMaxFileBytes: 65536
+  readonly property int syncMaxOutputChars: 4194304   // syncMaxFiles * syncMaxFileBytes
+  readonly property int syncMaxSnapshots: 64
+  readonly property int syncMaxProvidersPerSnapshot: 32
+  readonly property int syncMaxProviders: 32
+  readonly property int syncMaxEntriesPerMap: 64
+  // Active days are a real history — a year of use is 365 legitimate entries —
+  // so this one is loose enough not to undercount, and still finite.
+  readonly property int syncMaxDates: 512
+  readonly property int syncMaxTextChars: 64
+
+  // A sync directory is meant to be a synced folder under $HOME or a mounted
+  // drive. Anything else — /proc, /sys, /etc, another user's home — is a tree
+  // this widget has no business walking on a timer.
+  readonly property var syncAllowedRoots: [root.home, "/mnt", "/media", "/run/media"]
+
+  function syncDirAllowed(dir) {
+    var value = String(dir || "")
+    if (value === "" || value.charAt(0) !== "/") return false
+    if (value.indexOf("/../") >= 0 || /\/\.\.$/.test(value)) return false
+    for (var i = 0; i < root.syncAllowedRoots.length; i++) {
+      var allowed = String(root.syncAllowedRoots[i] || "")
+      if (allowed !== "" && (value === allowed || value.indexOf(allowed + "/") === 0)) return true
+    }
+    return false
+  }
+
+  // Say so once when a configured directory is refused, rather than leaving
+  // the user with sync that looks enabled and never produces a snapshot.
+  onSyncEffectiveDirChanged: {
+    if (String(root.syncDir || "").trim() !== "" && !root.syncDirAllowed(root.syncEffectiveDir))
+      console.warn("agents/sync", "Ignoring sync dir outside "
+        + root.syncAllowedRoots.join(", ") + ":", root.syncEffectiveDir)
+  }
+
+  // Strips control characters and the angle brackets Qt sniffs a string as
+  // rich text by, then cuts to length. Provider names, model ids and dates
+  // arrive from other machines and are rendered by AutoText elements, where
+  // markup would render — <img> included, which fetches.
+  function safeSyncText(raw, limit) {
+    var value = String(raw === undefined || raw === null ? "" : raw)
+    value = value.replace(/[\x00-\x1f\x7f<>]+/g, " ").trim()
+    var max = limit > 0 ? limit : root.syncMaxTextChars
+    return value.length > max ? value.substring(0, max) : value
+  }
+QML
+
+ANCHOR_BOUNDS='  property double aggregateUpdatedAtMs: aggregateData && aggregateData.updatedAtMs ? Number(aggregateData.updatedAtMs) : 0'
+
+# Each pair below is the upstream line, then what stands in for it.
+
+ORIG_CONFIGURED='    return root.syncEnabled === true && String(root.syncDir || "").trim() !== ""'
+NEW_CONFIGURED="$(cat <<'TXT'
+    // [claude-status] a directory outside syncAllowedRoots switches sync off
+    return root.syncEnabled === true && String(root.syncDir || "").trim() !== ""
+      && root.syncDirAllowed(root.syncEffectiveDir)
+TXT
+)"
+
+ORIG_SCAN_SCRIPT="$(cat <<'TXT'
+    var script = "dir=$0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; printf '===%s===\\n' \"$f\"; cat \"$f\"; printf '\\n=== EOM ===\\n'; done"
+TXT
+)"
+NEW_SCAN_SCRIPT="$(cat <<'TXT'
+    // [claude-status] Bounded scan: regular files only and no symlinks, at
+    // most syncMaxFiles of them, at most syncMaxFileBytes read from each, and
+    // a sanitised basename as the header so a crafted filename cannot forge
+    // the "=== EOM ===" record separator and splice one file into another.
+    var script = "dir=$0; max_files=$1; max_bytes=$2; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; n=0; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] && [[ ! -L \"$f\" ]] || continue; n=$((n + 1)); [[ $n -gt $max_files ]] && break; b=${f##*/}; b=${b//[^A-Za-z0-9._-]/_}; printf '===%s===\\n' \"$b\"; head -c \"$max_bytes\" -- \"$f\"; printf '\\n=== EOM ===\\n'; done"
+TXT
+)"
+
+ORIG_SCAN_COMMAND='    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir]'
+NEW_SCAN_COMMAND="$(cat <<'TXT'
+    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir, // [claude-status]
+                               String(root.syncMaxFiles), String(root.syncMaxFileBytes)]
+TXT
+)"
+
+ANCHOR_PARSE='  function parseSyncScanOutput(output) {'
+IFS='' read -r -d '' PATCH_PARSE <<'QML'
+    // [claude-status] cap the collector's text before it is split
+    if (String(output || "").length > root.syncMaxOutputChars)
+      output = String(output).substring(0, root.syncMaxOutputChars)
+QML
+
+ORIG_PUSH='        if (parsed && parsed.providers) snapshots.push(parsed)'
+NEW_PUSH="$(cat <<'TXT'
+        // [claude-status] bound the snapshot count, not just the byte count
+        if (parsed && parsed.providers && snapshots.length < root.syncMaxSnapshots) snapshots.push(parsed)
+TXT
+)"
+
+ORIG_PROVIDER_LOOP='      for (var providerId in snapshotProviders) {'
+NEW_PROVIDER_LOOP="$(cat <<'TXT'
+      var providerCount = 0 // [claude-status]
+      for (var providerId in snapshotProviders) {
+        if (++providerCount > root.syncMaxProvidersPerSnapshot) break // [claude-status]
+        var safeProviderId = root.safeSyncText(providerId, 64) // [claude-status]
+        if (safeProviderId === "") continue // [claude-status]
+        // [claude-status] every snapshot may name providers this machine has
+        // never heard of, so cap the accumulator across all of them too
+        if (!providers[safeProviderId] && Object.keys(providers).length >= root.syncMaxProviders) continue
+TXT
+)"
+
+ORIG_PROVIDER_ACC='        var acc = providerAcc(String(providerId))'
+NEW_PROVIDER_ACC='        var acc = providerAcc(safeProviderId) // [claude-status]'
+
+ORIG_PROVIDER_NAME='        if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)'
+NEW_PROVIDER_NAME='        if (stats.providerName && acc.providerName === "") acc.providerName = root.safeSyncText(stats.providerName) // [claude-status]'
+
+ORIG_ACTIVE_DATES='        for (var ad = 0; ad < activeDates.length; ad++) acc.activeDates[String(activeDates[ad])] = true'
+NEW_ACTIVE_DATES="$(cat <<'TXT'
+        var activeDateMax = Math.min(activeDates.length, root.syncMaxDates) // [claude-status]
+        for (var ad = 0; ad < activeDateMax; ad++) {
+          var activeDate = root.safeSyncText(activeDates[ad], 32) // [claude-status]
+          if (activeDate === "" || acc.activeDates[activeDate] === true) continue
+          if (Object.keys(acc.activeDates).length >= root.syncMaxDates) break
+          acc.activeDates[activeDate] = true
+        }
+TXT
+)"
+
+ORIG_RECENT_LOOP='        for (var r = 0; r < recent.length; r++) {'
+NEW_RECENT_LOOP='        for (var r = 0; r < recent.length && r < root.syncMaxEntriesPerMap; r++) { // [claude-status]'
+
+ORIG_MODEL_LOOP='        for (var modelId in usage) {'
+NEW_MODEL_LOOP="$(cat <<'TXT'
+        var modelCount = 0 // [claude-status]
+        for (var rawModelId in usage) {
+          if (++modelCount > root.syncMaxEntriesPerMap) break // [claude-status]
+          var modelId = root.safeSyncText(rawModelId, 96) // [claude-status]
+          if (modelId === "") continue // [claude-status]
+TXT
+)"
+
+ORIG_MODEL_BUCKET='          if (!bucket) bucket = acc.modelUsage[modelId] = emptyTokenBucket()'
+NEW_MODEL_BUCKET="$(cat <<'TXT'
+          if (!bucket) {
+            // [claude-status] a foreign snapshot may name models this machine
+            // has never run, so cap the bucket count across all snapshots
+            if (Object.keys(acc.modelUsage).length >= root.syncMaxEntriesPerMap) continue
+            bucket = acc.modelUsage[modelId] = emptyTokenBucket()
+          }
+TXT
+)"
+
+ORIG_MODEL_COMBINE='          combineObjectNumbers(additive, bucket, usage[modelId] || {})'
+NEW_MODEL_COMBINE='          combineObjectNumbers(additive, bucket, usage[rawModelId] || {}) // [claude-status]'
+
+ORIG_COMBINE_KEYS='    for (var key in source) target[key] = combineNumber(additive, target[key], source[key])'
+NEW_COMBINE_KEYS="$(cat <<'TXT'
+    // [claude-status] keys come from foreign snapshots: bound and sanitise them
+    var keyCount = 0
+    for (var rawKey in source) {
+      if (++keyCount > root.syncMaxEntriesPerMap) break
+      var key = root.safeSyncText(rawKey, 96)
+      if (key === "") continue
+      if (target[key] === undefined && Object.keys(target).length >= root.syncMaxEntriesPerMap) continue
+      target[key] = combineNumber(additive, target[key], source[rawKey])
+    }
+TXT
+)"
+
 # splice <file> <anchor> <after|before> <text>
 splice() {
   local file="$1" anchor="$2" where="$3" text="$4"
@@ -104,6 +302,22 @@ splice() {
     $0 == anchor && where == "before" { print text }
     { print }
     $0 == anchor && where == "after" { print text }
+  ' "$file" >"$file.tmp" && mv "$file.tmp" "$file"
+}
+
+# replace <file> <line> <text>   — the line must appear exactly once
+replace() {
+  local file="$1" line="$2" text="$3"
+  local count
+  count="$(grep -Fxc -- "$line" "$file" 2>/dev/null || echo 0)"
+  [ "$count" = "1" ] || die "line appears $count times, expected once:
+       '$line'
+       upstream rewrote it — re-apply this patch by hand, then update resync."
+  LINE="$line" TEXT="$text" awk '
+    BEGIN { line = ENVIRON["LINE"]; text = ENVIRON["TEXT"]
+            sub(/\n$/, "", text) }
+    $0 == line { print text; next }
+    { print }
   ' "$file" >"$file.tmp" && mv "$file.tmp" "$file"
 }
 
@@ -153,13 +367,19 @@ lint_ours() {
 
 # ------------------------------------------------------------------- --check
 
+PANEL_MARKERS=5
+MAIN_MARKERS=23
+
 if [ "$MODE" = "check" ]; then
-  n="$(patched_count "$PLUGIN_DIR/Panel.qml")"
   for f in ClaudeStatus.qml ClaudeSessions.qml; do
     [ -f "$PLUGIN_DIR/$f" ] || die "$f is missing"
   done
-  [ "$n" = "4" ] || die "expected 4 [claude-status] markers in Panel.qml, found $n"
-  echo "resync: patches present (4 markers, both QML files, id $PLUGIN_ID)"
+  for f in Panel:"$PANEL_MARKERS" Main:"$MAIN_MARKERS"; do
+    want="${f#*:}"; file="${f%%:*}.qml"
+    got="$(patched_count "$PLUGIN_DIR/$file")"
+    [ "$got" = "$want" ] || die "expected $want [claude-status] markers in $file, found $got"
+  done
+  echo "resync: patches present ($PANEL_MARKERS Panel + $MAIN_MARKERS Main markers, both QML files, id $PLUGIN_ID)"
   exit 0
 fi
 
@@ -195,10 +415,28 @@ note "took Panel.qml, Main.qml, Agent.qml, manifest.json, assets/ from $UPSTREAM
 rm -rf "$UPSTREAM_SNAPSHOT"; mkdir -p "$UPSTREAM_SNAPSHOT"
 cp -a "$UPSTREAM"/*.qml "$UPSTREAM/manifest.json" "$UPSTREAM_SNAPSHOT/" 2>/dev/null
 
-splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_STATUS"   after  "$PATCH_STATUS"
-splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_BUTTON"   after  "$PATCH_BUTTON"
-splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_SESSIONS" before "$PATCH_SESSIONS"
-note "re-applied 3 patches to Panel.qml"
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_STATUS"     after  "$PATCH_STATUS"
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_BUTTON"     after  "$PATCH_BUTTON"
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_SESSIONS"   before "$PATCH_SESSIONS"
+splice "$PLUGIN_DIR/Panel.qml" "$ANCHOR_MODEL_NAME" after  "$PATCH_MODEL_NAME"
+note "re-applied 4 patches to Panel.qml"
+
+splice  "$PLUGIN_DIR/Main.qml" "$ANCHOR_BOUNDS" after "$PATCH_BOUNDS"
+splice  "$PLUGIN_DIR/Main.qml" "$ANCHOR_PARSE"  after "$PATCH_PARSE"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_CONFIGURED"     "$NEW_CONFIGURED"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_SCAN_SCRIPT"    "$NEW_SCAN_SCRIPT"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_SCAN_COMMAND"   "$NEW_SCAN_COMMAND"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_PUSH"           "$NEW_PUSH"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_PROVIDER_LOOP"  "$NEW_PROVIDER_LOOP"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_PROVIDER_ACC"   "$NEW_PROVIDER_ACC"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_PROVIDER_NAME"  "$NEW_PROVIDER_NAME"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_ACTIVE_DATES"   "$NEW_ACTIVE_DATES"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_RECENT_LOOP"    "$NEW_RECENT_LOOP"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_MODEL_LOOP"     "$NEW_MODEL_LOOP"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_MODEL_BUCKET"   "$NEW_MODEL_BUCKET"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_MODEL_COMBINE"  "$NEW_MODEL_COMBINE"
+replace "$PLUGIN_DIR/Main.qml" "$ORIG_COMBINE_KEYS"   "$NEW_COMBINE_KEYS"
+note "re-applied sync-scan bounds to Main.qml"
 
 # Upstream's manifest calls itself omarchy.agents and credits Omarchy. Take
 # their functional fields — barWidget defaults, the settings schema — and lay
@@ -221,8 +459,11 @@ fi
 
 lint_ours
 
-markers="$(patched_count "$PLUGIN_DIR/Panel.qml")"
-[ "$markers" = "4" ] || die "expected 4 [claude-status] markers after patching, found $markers"
+for f in Panel:"$PANEL_MARKERS" Main:"$MAIN_MARKERS"; do
+  want="${f#*:}"; file="${f%%:*}.qml"
+  markers="$(patched_count "$PLUGIN_DIR/$file")"
+  [ "$markers" = "$want" ] || die "expected $want [claude-status] markers in $file after patching, found $markers"
+done
 
 echo
 echo "resync: done. Restart the shell to load it:  omarchy restart shell"

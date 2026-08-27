@@ -911,6 +911,8 @@ Panel {
 
     Text {
       id: modelName
+      // [claude-status] the model id behind this comes from a synced snapshot
+      textFormat: Text.PlainText
       text: modelRow.row ? modelRow.row.name : ""
       color: root.foreground
       font.family: root.fontFamily

@@ -106,11 +106,12 @@ omarchy restart shell
 ```
 
 Everything original lives in `ClaudeStatus.qml` and `ClaudeSessions.qml`, which
-upstream never touches. The delta to their `Panel.qml` is three patches, marked
-`[claude-status]`. `resync` validates the manifest and runs `qmllint` over both
-original files, and fails loudly if an anchor stops matching rather than leaving
-a half-patched file — that failure is the signal upstream restructured
-`Panel.qml` and a human is needed.
+upstream never touches. The delta to their files is four patches to `Panel.qml`
+and the bounds on the sync path in `Main.qml` (see [Security](#security)), all
+marked `[claude-status]`. `resync` validates the manifest and runs `qmllint` over
+both original files, and fails loudly if an anchor stops matching rather than
+leaving a half-patched file — that failure is the signal upstream restructured
+the file and a human is needed.
 
 Two Omarchy quirks worth knowing if you hack on this:
 
@@ -144,10 +145,47 @@ omarchy restart shell
 ## Security
 
 Omarchy plugins share the long-running shell process and run unsandboxed with
-your permissions. This widget runs no commands; it reads two files. The hook
-script runs on every Claude Code tool call, writes small files, and shells out
-only to `jq`, `find` and `stat`. Both are short enough to read before you
-install them, and worth reading.
+your permissions. The Claude-status half runs no commands; it reads two files.
+The hook script runs on every Claude Code tool call, writes small files, and
+shells out only to `jq`, `find` and `stat`. Both are short enough to read before
+you install them, and worth reading.
+
+Every externally derived input is bounded before it is stored, parsed or drawn.
+
+The hook script, in `bin/omarchy-claude-status`:
+
+| Limit | Value |
+|---|---|
+| stdin payload | 64 KB, then the rest is drained so the caller never takes an EPIPE |
+| session id | 64 chars, after `[^A-Za-z0-9._-]` sanitising — it becomes a filename |
+| session label | 64 chars, after the control-character strip |
+| session files kept | 100, newest first, on top of the existing 8-hour prune |
+| per-file read | 256 B, with the two fields split before control characters are stripped |
+
+`ClaudeStatus.qml` re-applies the same caps on read rather than trusting the
+writer's, and `ClaudeSessions.qml` renders session and project names as
+`Text.PlainText`.
+
+**Usage sync.** If you turn on the built-in usage sync, the widget scans a
+directory of snapshot files written by your other machines. Upstream's scan is
+unbounded; this fork bounds it, because a shared folder is not trusted input:
+
+| Limit | Value |
+|---|---|
+| sync directory | must be under `$HOME`, `/mnt`, `/media` or `/run/media`; anything else is refused and logged, and sync stays off |
+| files scanned | 64, regular files only, symlinks skipped |
+| bytes per file | 64 KB |
+| collector output | 4 MB, capped before it is split |
+| snapshots parsed | 64 |
+| providers | 32 per snapshot, 32 in the merged result |
+| map keys (models, token buckets) | 64 |
+| active dates | 512 — a year of real history still counts |
+| synced strings | 64 chars (96 for ids), control characters and `<`/`>` removed, so nothing reaches an `AutoText` element as markup |
+
+The scan names each file by a sanitised basename, so a crafted filename in the
+synced folder cannot forge the record separator and splice one file into
+another. These bounds live in the bundled `Main.qml` and `Panel.qml` and are
+re-applied by `./resync`; they are a fork-local fix, not an upstream one.
 
 ## Credit and licence
 

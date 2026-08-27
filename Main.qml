@@ -299,6 +299,54 @@ Item {
   property string syncStatusText: ""
   property double aggregateUpdatedAtMs: aggregateData && aggregateData.updatedAtMs ? Number(aggregateData.updatedAtMs) : 0
 
+  // [claude-status] Bounds on the synced-snapshot path. See resync.
+  readonly property int syncMaxFiles: 64
+  readonly property int syncMaxFileBytes: 65536
+  readonly property int syncMaxOutputChars: 4194304   // syncMaxFiles * syncMaxFileBytes
+  readonly property int syncMaxSnapshots: 64
+  readonly property int syncMaxProvidersPerSnapshot: 32
+  readonly property int syncMaxProviders: 32
+  readonly property int syncMaxEntriesPerMap: 64
+  // Active days are a real history — a year of use is 365 legitimate entries —
+  // so this one is loose enough not to undercount, and still finite.
+  readonly property int syncMaxDates: 512
+  readonly property int syncMaxTextChars: 64
+
+  // A sync directory is meant to be a synced folder under $HOME or a mounted
+  // drive. Anything else — /proc, /sys, /etc, another user's home — is a tree
+  // this widget has no business walking on a timer.
+  readonly property var syncAllowedRoots: [root.home, "/mnt", "/media", "/run/media"]
+
+  function syncDirAllowed(dir) {
+    var value = String(dir || "")
+    if (value === "" || value.charAt(0) !== "/") return false
+    if (value.indexOf("/../") >= 0 || /\/\.\.$/.test(value)) return false
+    for (var i = 0; i < root.syncAllowedRoots.length; i++) {
+      var allowed = String(root.syncAllowedRoots[i] || "")
+      if (allowed !== "" && (value === allowed || value.indexOf(allowed + "/") === 0)) return true
+    }
+    return false
+  }
+
+  // Say so once when a configured directory is refused, rather than leaving
+  // the user with sync that looks enabled and never produces a snapshot.
+  onSyncEffectiveDirChanged: {
+    if (String(root.syncDir || "").trim() !== "" && !root.syncDirAllowed(root.syncEffectiveDir))
+      console.warn("agents/sync", "Ignoring sync dir outside "
+        + root.syncAllowedRoots.join(", ") + ":", root.syncEffectiveDir)
+  }
+
+  // Strips control characters and the angle brackets Qt sniffs a string as
+  // rich text by, then cuts to length. Provider names, model ids and dates
+  // arrive from other machines and are rendered by AutoText elements, where
+  // markup would render — <img> included, which fetches.
+  function safeSyncText(raw, limit) {
+    var value = String(raw === undefined || raw === null ? "" : raw)
+    value = value.replace(/[\x00-\x1f\x7f<>]+/g, " ").trim()
+    var max = limit > 0 ? limit : root.syncMaxTextChars
+    return value.length > max ? value.substring(0, max) : value
+  }
+
   onSyncEnabledChanged: syncSettingsChanged()
   onSyncDirChanged: syncSettingsChanged()
   onSyncFileNameChanged: if (syncConfigured()) scheduleSync()
@@ -368,7 +416,9 @@ Item {
   }
 
   function syncConfigured() {
+    // [claude-status] a directory outside syncAllowedRoots switches sync off
     return root.syncEnabled === true && String(root.syncDir || "").trim() !== ""
+      && root.syncDirAllowed(root.syncEffectiveDir)
   }
 
   function syncSettingsChanged() {
@@ -419,8 +469,13 @@ Item {
       finishSyncRun()
       return
     }
-    var script = "dir=$0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; printf '===%s===\\n' \"$f\"; cat \"$f\"; printf '\\n=== EOM ===\\n'; done"
-    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir]
+    // [claude-status] Bounded scan: regular files only and no symlinks, at
+    // most syncMaxFiles of them, at most syncMaxFileBytes read from each, and
+    // a sanitised basename as the header so a crafted filename cannot forge
+    // the "=== EOM ===" record separator and splice one file into another.
+    var script = "dir=$0; max_files=$1; max_bytes=$2; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; n=0; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] && [[ ! -L \"$f\" ]] || continue; n=$((n + 1)); [[ $n -gt $max_files ]] && break; b=${f##*/}; b=${b//[^A-Za-z0-9._-]/_}; printf '===%s===\\n' \"$b\"; head -c \"$max_bytes\" -- \"$f\"; printf '\\n=== EOM ===\\n'; done"
+    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir, // [claude-status]
+                               String(root.syncMaxFiles), String(root.syncMaxFileBytes)]
     syncScanProcess.running = true
   }
 
@@ -459,6 +514,9 @@ Item {
   }
 
   function parseSyncScanOutput(output) {
+    // [claude-status] cap the collector's text before it is split
+    if (String(output || "").length > root.syncMaxOutputChars)
+      output = String(output).substring(0, root.syncMaxOutputChars)
     var lines = String(output || "").split("\n")
     var snapshots = []
     var currentPath = ""
@@ -469,7 +527,8 @@ Item {
       var raw = currentJson.join("\n").trim()
       try {
         var parsed = JSON.parse(raw)
-        if (parsed && parsed.providers) snapshots.push(parsed)
+        // [claude-status] bound the snapshot count, not just the byte count
+        if (parsed && parsed.providers && snapshots.length < root.syncMaxSnapshots) snapshots.push(parsed)
       } catch (e) {
         console.warn("agents/sync", "Ignoring bad snapshot", currentPath, e)
       }
@@ -544,7 +603,15 @@ Item {
 
   function combineObjectNumbers(additive, target, source) {
     if (!source) return
-    for (var key in source) target[key] = combineNumber(additive, target[key], source[key])
+    // [claude-status] keys come from foreign snapshots: bound and sanitise them
+    var keyCount = 0
+    for (var rawKey in source) {
+      if (++keyCount > root.syncMaxEntriesPerMap) break
+      var key = root.safeSyncText(rawKey, 96)
+      if (key === "") continue
+      if (target[key] === undefined && Object.keys(target).length >= root.syncMaxEntriesPerMap) continue
+      target[key] = combineNumber(additive, target[key], source[rawKey])
+    }
   }
 
   function aggregateSnapshots(snapshots) {
@@ -582,11 +649,18 @@ Item {
       var device = safeDeviceId(snapshot.deviceId || "device")
       devices[device] = true
       var snapshotProviders = snapshot.providers || {}
+      var providerCount = 0 // [claude-status]
       for (var providerId in snapshotProviders) {
+        if (++providerCount > root.syncMaxProvidersPerSnapshot) break // [claude-status]
+        var safeProviderId = root.safeSyncText(providerId, 64) // [claude-status]
+        if (safeProviderId === "") continue // [claude-status]
+        // [claude-status] every snapshot may name providers this machine has
+        // never heard of, so cap the accumulator across all of them too
+        if (!providers[safeProviderId] && Object.keys(providers).length >= root.syncMaxProviders) continue
         var stats = snapshotProviders[providerId] || {}
-        var acc = providerAcc(String(providerId))
+        var acc = providerAcc(safeProviderId) // [claude-status]
         acc.devices[device] = true
-        if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)
+        if (stats.providerName && acc.providerName === "") acc.providerName = root.safeSyncText(stats.providerName) // [claude-status]
         acc.ready = acc.ready || stats.ready === true
         acc.hasLocalStats = acc.hasLocalStats || stats.hasLocalStats !== false
         // Snapshots from before the field existed only came from agents that
@@ -602,12 +676,18 @@ Item {
         // summing counts. Snapshots written before activeDates existed only
         // carry a count; the widest one stands in for them.
         var activeDates = Array.isArray(stats.activeDates) ? stats.activeDates : []
-        for (var ad = 0; ad < activeDates.length; ad++) acc.activeDates[String(activeDates[ad])] = true
+        var activeDateMax = Math.min(activeDates.length, root.syncMaxDates) // [claude-status]
+        for (var ad = 0; ad < activeDateMax; ad++) {
+          var activeDate = root.safeSyncText(activeDates[ad], 32) // [claude-status]
+          if (activeDate === "" || acc.activeDates[activeDate] === true) continue
+          if (Object.keys(acc.activeDates).length >= root.syncMaxDates) break
+          acc.activeDates[activeDate] = true
+        }
         acc.activeDays = Math.max(acc.activeDays, numberValue(stats.activeDays))
         combineObjectNumbers(additive, acc.todayTokensByModel, stats.todayTokensByModel || {})
 
         var recent = Array.isArray(stats.recentDays) ? stats.recentDays : []
-        for (var r = 0; r < recent.length; r++) {
+        for (var r = 0; r < recent.length && r < root.syncMaxEntriesPerMap; r++) { // [claude-status]
           var day = recent[r] || {}
           var date = String(day.date || "")
           if (acc.recentByDay[date] !== undefined)
@@ -615,10 +695,19 @@ Item {
         }
 
         var usage = stats.modelUsage || {}
-        for (var modelId in usage) {
+        var modelCount = 0 // [claude-status]
+        for (var rawModelId in usage) {
+          if (++modelCount > root.syncMaxEntriesPerMap) break // [claude-status]
+          var modelId = root.safeSyncText(rawModelId, 96) // [claude-status]
+          if (modelId === "") continue // [claude-status]
           var bucket = acc.modelUsage[modelId]
-          if (!bucket) bucket = acc.modelUsage[modelId] = emptyTokenBucket()
-          combineObjectNumbers(additive, bucket, usage[modelId] || {})
+          if (!bucket) {
+            // [claude-status] a foreign snapshot may name models this machine
+            // has never run, so cap the bucket count across all snapshots
+            if (Object.keys(acc.modelUsage).length >= root.syncMaxEntriesPerMap) continue
+            bucket = acc.modelUsage[modelId] = emptyTokenBucket()
+          }
+          combineObjectNumbers(additive, bucket, usage[rawModelId] || {}) // [claude-status]
         }
       }
     }

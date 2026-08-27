@@ -10,13 +10,17 @@ instead of adding a second icon.
 
 From Omarchy, unmodified:
 
-    Main.qml
     Agent.qml
     assets/
 
-From Omarchy, with three additions marked `[claude-status]`:
+From Omarchy, with additions marked `[claude-status]`:
 
-    Panel.qml
+    Panel.qml    four additions: the status component, the bar button
+                 bindings, the sessions list, and plain-text rendering
+                 for the synced model name
+    Main.qml     bounds on the synced-snapshot path — allowed sync
+                 directories, file and byte caps on the scan, and caps
+                 and sanitising on everything parsed out of it
 
 Original to this plugin:
 
@@ -28,5 +32,5 @@ Original to this plugin:
     manifest.identity.json
 
 `resync` re-derives the Omarchy-derived files from the copy of Omarchy
-installed on the machine and re-applies the three additions, so the fork can
-be brought back in line after an `omarchy update`.
+installed on the machine and re-applies those additions, so the fork can be
+brought back in line after an `omarchy update`.
